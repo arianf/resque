@@ -143,6 +143,7 @@ module Resque
     def initialize(*queues)
       @shutdown = nil
       @paused = nil
+      @cached_pause_value = nil
       @before_first_fork_hook_ran = false
 
       @heartbeat_thread = nil
@@ -237,21 +238,44 @@ module Resque
     # The default is 5 seconds, but for a semi-active site you may
     # want to use a smaller value.
     #
+    # Can also be passed 3 interval floats: max, min, backoff.
+    # The actual sleep amount will float between these min/max
+    # bounds.
+    #
+    # If a job is picked up we sleep for the minimum amount of
+    # time, but as the queues empty we increase the backoff to the
+    # max interval. This prevents idle workers from hammering the
+    # redis server with lpop requests.
+    #
     # Also accepts a block which will be passed the job as soon as it
     # has completed processing. Useful for testing.
-    def work(interval = 5.0, &block)
-      interval = Float(interval)
+    def work(interval = 5.0,
+             min_interval: nil,     # defaults to interval
+             max_interval: nil,     # defaults to interval
+             backoff_interval: nil, # defaults to 0.1
+             &block)
+      interval = Float(interval || 5.0)
+      max_interval = Float(max_interval || interval)
+      min_interval = Float(min_interval || interval).clamp(nil, max_interval)
+      backoff_interval = Float(backoff_interval || 0.1).clamp(nil, max_interval)
+      interval = interval.clamp(min_interval, max_interval)
       startup
 
       loop do
         break if shutdown?
         start_heartbeat if !heartbeat_alive?
 
-        unless work_one_job(&block)
+        if work_one_job(&block)
+          interval = min_interval
+        else
           state_change
           break if interval.zero?
+
+          interval = (interval + backoff_interval)
+            .clamp(nil, max_interval)
+
           log_with_severity :debug, "Sleeping for #{interval} seconds"
-          procline paused? ? "Paused" : "Waiting for #{queues.join(',')}"
+          procline @cached_pause_value ? "Paused" : "Waiting for #{queues.join(',')}"
           sleep interval
         end
       end
@@ -261,6 +285,7 @@ module Resque
     rescue Exception => exception
       return if exception.class == SystemExit && !@child && run_at_exit_hooks
       log_with_severity :error, "Failed to start worker : #{exception.inspect}"
+      log_with_severity :error, exception.backtrace.join("\n")
       unregister_worker(exception)
       run_hook :worker_exit
     end
@@ -442,6 +467,8 @@ module Resque
     def shutdown
       log_with_severity :info, 'Exiting...'
       @shutdown = true
+      run_hook :shutdown
+      true
     end
 
     # Kill the child and shutdown immediately.
@@ -584,20 +611,22 @@ module Resque
 
     # are we paused?
     def paused?
-      @paused || redis.get('pause-all-workers').to_s.strip.downcase == 'true'
+      @cached_pause_value = @paused || redis.get('pause-all-workers').to_s.strip.downcase == 'true'
     end
 
     # Stop processing jobs after the current one has completed (if we're
     # currently running one).
     def pause_processing
-      log_with_severity :info, "USR2 received; pausing job processing"
+      _, self_write = IO.pipe
+      self_write.puts "USR2 received; pausing job processing"
       run_hook :before_pause, self
       @paused = true
     end
 
     # Start processing jobs again after a pause
     def unpause_processing
-      log_with_severity :info, "CONT received; resuming job processing"
+      _, self_write = IO.pipe
+      self_write.puts "CONT received; resuming job processing"
       @paused = false
       run_hook :after_pause, self
     end
