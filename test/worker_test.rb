@@ -878,6 +878,90 @@ describe "Resque::Worker" do
     workerA.start_heartbeat
   end
 
+  it "reports the heartbeat thread as not alive before it has been started" do
+    workerA = Resque::Worker.new(:jobs)
+
+    refute workerA.heartbeat_alive?
+  end
+
+  it "reports the heartbeat thread as not alive once it has died" do
+    workerA = Resque::Worker.new(:jobs)
+    workerA.register_worker
+    workerA.start_heartbeat
+
+    assert workerA.heartbeat_alive?
+
+    kill_heartbeat_thread(workerA)
+
+    refute workerA.heartbeat_alive?
+  end
+
+  it "keeps the heartbeat thread alive when a heartbeat fails" do
+    workerA = Resque::Worker.new(:jobs)
+    workerA.register_worker
+    workerA.stubs(:heartbeat!).raises(Redis::CannotConnectError, 'simulated redis outage')
+    Resque.logger = DummyLogger.new
+
+    workerA.start_heartbeat
+    thread = workerA.instance_variable_get(:@heartbeat_thread)
+    Timeout.timeout(5) { sleep 0.01 until thread.status == 'sleep' }
+
+    assert workerA.heartbeat_alive?
+    assert_equal 1, Resque.logger.messages.grep(/Failed to send heartbeat/).size
+  end
+
+  it "restarts a dead heartbeat thread and resumes heartbeats while working" do
+    Resque::Job.create(:jobs, SomeJob, 20, '/tmp')
+    threads = []
+
+    without_forking do
+      @worker.extend(AssertInWorkBlock).work(0) do
+        threads << @worker.instance_variable_get(:@heartbeat_thread)
+
+        if threads.size == 1
+          kill_heartbeat_thread(@worker)
+        else
+          assert @worker.heartbeat_alive?
+
+          Timeout.timeout(5) do
+            sleep 0.01 until Resque::Worker.all_heartbeats.key?(@worker.to_s)
+          end
+        end
+      end
+    end
+
+    assert_equal 2, threads.size
+    refute_same threads.first, threads.last
+  end
+
+  it "does not keep dead heartbeat threads around after restarting them" do
+    workerA = Resque::Worker.new(:jobs)
+    workerA.register_worker
+    workerA.start_heartbeat
+    dead_thread = workerA.instance_variable_get(:@heartbeat_thread)
+
+    kill_heartbeat_thread(workerA)
+    workerA.start_heartbeat
+
+    all_threads = Resque::Worker.class_variable_get(:@@all_heartbeat_threads)
+    refute_includes all_threads, dead_thread
+    assert_includes all_threads, workerA.instance_variable_get(:@heartbeat_thread)
+  end
+
+  it "does not restart a live heartbeat thread while working" do
+    Resque::Job.create(:jobs, SomeJob, 20, '/tmp')
+    threads = []
+
+    without_forking do
+      @worker.work(0) do
+        threads << @worker.instance_variable_get(:@heartbeat_thread)
+      end
+    end
+
+    assert_equal 2, threads.size
+    assert_same threads.first, threads.last
+  end
+
   it "cleans up heartbeat after unregistering" do
     workerA = Resque::Worker.new(:jobs)
     workerA.register_worker

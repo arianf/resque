@@ -263,6 +263,8 @@ module Resque
 
       loop do
         break if shutdown?
+        # A heartbeat thread that died leaves the worker running but invisible to Resque.workers
+        start_heartbeat if !heartbeat_alive?
 
         if work_one_job(&block)
           interval = min_interval
@@ -550,16 +552,26 @@ module Resque
       remove_heartbeat
 
       @heartbeat_thread_signal = Resque::ThreadSignal.new
+      @@all_heartbeat_threads.delete(@heartbeat_thread) if !heartbeat_alive?
 
       @heartbeat_thread = Thread.new do
         loop do
-          heartbeat!
+          begin
+            heartbeat!
+          rescue Redis::BaseError => exception
+            log_with_severity :error, "Failed to send heartbeat: #{exception.inspect}"
+          end
+
           signaled = @heartbeat_thread_signal.wait_for_signal(Resque.heartbeat_interval)
           break if signaled
         end
       end
 
       @@all_heartbeat_threads << @heartbeat_thread
+    end
+
+    def heartbeat_alive?
+      !@heartbeat_thread.nil? && @heartbeat_thread.alive?
     end
 
     # Kills the forked child immediately with minimal remorse. The job it

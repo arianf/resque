@@ -260,6 +260,19 @@ def without_forking
   end
 end
 
+# Waits until the worker's heartbeat thread is idle between beats so it is never
+# killed in the middle of a Redis call, then kills it.
+def kill_heartbeat_thread(worker, timeout = 5)
+  thread = worker.instance_variable_get(:@heartbeat_thread)
+
+  Timeout.timeout(timeout) do
+    sleep 0.01 until Resque::Worker.all_heartbeats.key?(worker.to_s) && thread.status == 'sleep'
+  end
+
+  thread.kill
+  thread.join
+end
+
 def with_pidfile
   old_pidfile = ENV["PIDFILE"]
   begin
